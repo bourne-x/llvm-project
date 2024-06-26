@@ -93,7 +93,7 @@ public:
 
 /// NumberExprAST - Expression class for numeric literals like "1.0".
 class NumberExprAST : public ExprAST {
-  double Val;
+  double Val;  //====== BOURNE: instance variable.
 
 public:
   NumberExprAST(double Val) : Val(Val) {}
@@ -110,12 +110,15 @@ public:
 /// BinaryExprAST - Expression class for a binary operator.
 class BinaryExprAST : public ExprAST {
   char Op;
-  std::unique_ptr<ExprAST> LHS, RHS;
+  std::unique_ptr<ExprAST> LHS, RHS;  
+  //======== BOURNE: std::unique_ptr 是一个智能指针，确保在其生命周期结束时自动删除所指向的对象,另一个特性独占所有权。
 
 public:
   BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
                 std::unique_ptr<ExprAST> RHS)
-      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}  //======== BOURNE: 成员初始化列表
+  //======== BOURNE: 类的构造函数
+  //======== BOURNE: std::move 用于将传入的左操作数和右操作数转移到类成员变量中。允许资源（如内存）的所有权从一个对象转移到另一个对象，而不是复制资源。
 };
 
 /// CallExprAST - Expression class for function calls.
