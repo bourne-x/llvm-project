@@ -18,6 +18,7 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/OpenMPClause.h"
 #include "clang/AST/PrettyDeclStackTrace.h"
+#include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ASTRecordWriter.h"
@@ -527,16 +528,12 @@ void ASTDeclWriter::VisitEnumDecl(EnumDecl *D) {
   BitsPacker EnumDeclBits;
   EnumDeclBits.addBits(D->getNumPositiveBits(), /*BitWidth=*/8);
   EnumDeclBits.addBits(D->getNumNegativeBits(), /*BitWidth=*/8);
-  bool ShouldSkipCheckingODR = shouldSkipCheckingODR(D);
-  EnumDeclBits.addBit(ShouldSkipCheckingODR);
   EnumDeclBits.addBit(D->isScoped());
   EnumDeclBits.addBit(D->isScopedUsingClassTag());
   EnumDeclBits.addBit(D->isFixed());
   Record.push_back(EnumDeclBits);
 
-  // We only perform ODR checks for decls not in GMF.
-  if (!ShouldSkipCheckingODR)
-    Record.push_back(D->getODRHash());
+  Record.push_back(D->getODRHash());
 
   if (MemberSpecializationInfo *MemberInfo = D->getMemberSpecializationInfo()) {
     Record.AddDeclRef(MemberInfo->getInstantiatedFrom());
@@ -553,7 +550,7 @@ void ASTDeclWriter::VisitEnumDecl(EnumDecl *D) {
       !D->isTopLevelDeclInObjCContainer() &&
       !CXXRecordDecl::classofKind(D->getKind()) &&
       !D->getIntegerTypeSourceInfo() && !D->getMemberSpecializationInfo() &&
-      !needsAnonymousDeclarationNumber(D) && !shouldSkipCheckingODR(D) &&
+      !needsAnonymousDeclarationNumber(D) &&
       D->getDeclName().getNameKind() == DeclarationName::Identifier)
     AbbrevToUse = Writer.getDeclEnumAbbrev();
 
@@ -627,6 +624,33 @@ void ASTDeclWriter::VisitDeclaratorDecl(DeclaratorDecl *D) {
   // The location information is deferred until the end of the record.
   Record.AddTypeRef(D->getTypeSourceInfo() ? D->getTypeSourceInfo()->getType()
                                            : QualType());
+}
+
+static llvm::SmallVector<const Decl *, 2> collectLambdas(FunctionDecl *D) {
+  struct LambdaCollector : public ConstStmtVisitor<LambdaCollector> {
+    llvm::SmallVectorImpl<const Decl *> &Lambdas;
+
+    LambdaCollector(llvm::SmallVectorImpl<const Decl *> &Lambdas)
+        : Lambdas(Lambdas) {}
+
+    void VisitLambdaExpr(const LambdaExpr *E) {
+      VisitStmt(E);
+      Lambdas.push_back(E->getLambdaClass());
+    }
+
+    void VisitStmt(const Stmt *S) {
+      if (!S)
+        return;
+      for (const Stmt *Child : S->children())
+        if (Child)
+          Visit(Child);
+    }
+  };
+
+  llvm::SmallVector<const Decl *, 2> Lambdas;
+  if (D->hasBody())
+    LambdaCollector(Lambdas).VisitStmt(D->getBody());
+  return Lambdas;
 }
 
 void ASTDeclWriter::VisitFunctionDecl(FunctionDecl *D) {
@@ -719,8 +743,6 @@ void ASTDeclWriter::VisitFunctionDecl(FunctionDecl *D) {
   // FIXME: stable encoding
   FunctionDeclBits.addBits(llvm::to_underlying(D->getLinkageInternal()), 3);
   FunctionDeclBits.addBits((uint32_t)D->getStorageClass(), /*BitWidth=*/3);
-  bool ShouldSkipCheckingODR = shouldSkipCheckingODR(D);
-  FunctionDeclBits.addBit(ShouldSkipCheckingODR);
   FunctionDeclBits.addBit(D->isInlineSpecified());
   FunctionDeclBits.addBit(D->isInlined());
   FunctionDeclBits.addBit(D->hasSkippedBody());
@@ -746,9 +768,7 @@ void ASTDeclWriter::VisitFunctionDecl(FunctionDecl *D) {
   if (D->isExplicitlyDefaulted())
     Record.AddSourceLocation(D->getDefaultLoc());
 
-  // We only perform ODR checks for decls not in GMF.
-  if (!ShouldSkipCheckingODR)
-    Record.push_back(D->getODRHash());
+  Record.push_back(D->getODRHash());
 
   if (D->isDefaulted() || D->isDeletedAsWritten()) {
     if (auto *FDI = D->getDefalutedOrDeletedInfo()) {
@@ -772,6 +792,19 @@ void ASTDeclWriter::VisitFunctionDecl(FunctionDecl *D) {
   Record.push_back(D->param_size());
   for (auto *P : D->parameters())
     Record.AddDeclRef(P);
+
+  // Store references to all lambda decls inside function to load them
+  // immediately after loading the function to make sure that canonical
+  // decls for lambdas will be from the same module.
+  if (D->isCanonicalDecl()) {
+    llvm::SmallVector<const Decl *, 2> Lambdas = collectLambdas(D);
+    Record.push_back(Lambdas.size());
+    for (const auto *L : Lambdas)
+      Record.AddDeclRef(L);
+  } else {
+    Record.push_back(0);
+  }
+
   Code = serialization::DECL_FUNCTION;
 }
 
@@ -1383,7 +1416,7 @@ void ASTDeclWriter::VisitNamespaceDecl(NamespaceDecl *D) {
   Record.AddSourceLocation(D->getBeginLoc());
   Record.AddSourceLocation(D->getRBraceLoc());
 
-  if (D->isOriginalNamespace())
+  if (D->isFirstDecl())
     Record.AddDeclRef(D->getAnonymousNamespace());
   Code = serialization::DECL_NAMESPACE;
 
@@ -1544,7 +1577,7 @@ void ASTDeclWriter::VisitCXXRecordDecl(CXXRecordDecl *D) {
   // deserializing every method so we can compute it.
   //
   // FIXME: Avoid adding the key function if the class is defined in
-  // module purview since the key function is meaningless in module purview.
+  // module purview since in that case the key function is meaningless.
   if (D->isCompleteDefinition())
     Record.AddDeclRef(Context.getCurrentKeyFunction(D));
 
@@ -1566,8 +1599,7 @@ void ASTDeclWriter::VisitCXXMethodDecl(CXXMethodDecl *D) {
       D->getFirstDecl() == D->getMostRecentDecl() && !D->isInvalidDecl() &&
       !D->hasAttrs() && !D->isTopLevelDeclInObjCContainer() &&
       D->getDeclName().getNameKind() == DeclarationName::Identifier &&
-      !shouldSkipCheckingODR(D) && !D->hasExtInfo() &&
-      !D->isExplicitlyDefaulted()) {
+      !D->hasExtInfo() && !D->isExplicitlyDefaulted()) {
     if (D->getTemplatedKind() == FunctionDecl::TK_NonTemplate ||
         D->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate ||
         D->getTemplatedKind() == FunctionDecl::TK_MemberSpecialization ||
@@ -1669,6 +1701,7 @@ void ASTDeclWriter::VisitFriendDecl(FriendDecl *D) {
   Record.AddDeclRef(D->getNextFriend());
   Record.push_back(D->UnsupportedFriend);
   Record.AddSourceLocation(D->FriendLoc);
+  Record.AddSourceLocation(D->EllipsisLoc);
   Code = serialization::DECL_FRIEND;
 }
 
@@ -2247,6 +2280,7 @@ getFunctionDeclAbbrev(serialization::DeclCode Code) {
   //
   // This is:
   //         NumParams and Params[] from FunctionDecl, and
+  //         NumLambdas, Lambdas[] from FunctionDecl, and
   //         NumOverriddenMethods, OverriddenMethods[] from CXXMethodDecl.
   //
   //  Add an AbbrevOp for 'size then elements' and use it here.

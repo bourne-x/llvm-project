@@ -335,7 +335,7 @@ public:
 private:
   std::string ClassName;
 
-  const RecordKeeper &RK;
+  RecordKeeper &RK;
   const CodeGenDAGPatterns CGP;
   const CodeGenTarget &Target;
   CodeGenRegBank &CGRegs;
@@ -1162,7 +1162,7 @@ Error GlobalISelEmitter::importChildMatcher(
       OperandMatcher &OM =
           InsnOperand.getInsnMatcher().addOperand(0, "", TempOpIdx);
       if (auto Error =
-              OM.addTypeCheckPredicate(VTy, false /* OperandIsAPointer */))
+              OM.addTypeCheckPredicate(TypeSetByHwMode(VTy), false /* OperandIsAPointer */))
         return failedImport(toString(std::move(Error)) +
                             " for result of Src pattern operator");
 
@@ -1704,7 +1704,7 @@ Expected<action_iterator> GlobalISelEmitter::importExplicitUseRenderers(
     unsigned InstOpNo = DstI->Operands.NumDefs + I;
 
     // Determine what to emit for this operand.
-    Record *OperandNode = DstI->Operands[InstOpNo].Rec;
+    const Record *OperandNode = DstI->Operands[InstOpNo].Rec;
 
     // If the operand has default values, introduce them now.
     if (CGP.operandHasDefault(OperandNode) &&
@@ -1713,7 +1713,7 @@ Expected<action_iterator> GlobalISelEmitter::importExplicitUseRenderers(
       // overridden, or which we aren't letting it override; emit the 'default
       // ops' operands.
 
-      Record *OperandNode = DstI->Operands[InstOpNo].Rec;
+      const Record *OperandNode = DstI->Operands[InstOpNo].Rec;
       if (auto Error = importDefaultOperandRenderers(
               InsertPt, M, DstMIBuilder, CGP.getDefaultOperand(OperandNode)))
         return std::move(Error);
@@ -1850,7 +1850,7 @@ GlobalISelEmitter::inferRegClassFromPattern(const TreePatternNode &N) {
   // Handle destination record types that we can safely infer a register class
   // from.
   const auto &DstIOperand = Inst.Operands[0];
-  Record *DstIOpRec = DstIOperand.Rec;
+  const Record *DstIOpRec = DstIOperand.Rec;
   if (DstIOpRec->isSubClassOf("RegisterOperand")) {
     DstIOpRec = DstIOpRec->getValueAsDef("RegClass");
     const CodeGenRegisterClass &RC = Target.getRegisterClass(DstIOpRec);
@@ -2045,7 +2045,7 @@ Expected<RuleMatcher> GlobalISelEmitter::runOnPattern(const PatternToMatch &P) {
     const TypeSetByHwMode &VTy = Src.getExtType(I);
 
     const auto &DstIOperand = DstI.Operands[OpIdx];
-    PointerUnion<Record *, const CodeGenRegisterClass *> MatchedRC =
+    PointerUnion<const Record *, const CodeGenRegisterClass *> MatchedRC =
         DstIOperand.Rec;
     if (DstIName == "COPY_TO_REGCLASS") {
       MatchedRC = getInitValueAsRegClass(Dst.getChild(1).getLeafValue());
@@ -2082,9 +2082,9 @@ Expected<RuleMatcher> GlobalISelEmitter::runOnPattern(const PatternToMatch &P) {
         return failedImport(
             "Cannot infer register class for SUBREG_TO_REG operand #0");
       MatchedRC = *MaybeRegClass;
-    } else if (MatchedRC.get<Record *>()->isSubClassOf("RegisterOperand"))
-      MatchedRC = MatchedRC.get<Record *>()->getValueAsDef("RegClass");
-    else if (!MatchedRC.get<Record *>()->isSubClassOf("RegisterClass"))
+    } else if (MatchedRC.get<const Record *>()->isSubClassOf("RegisterOperand"))
+      MatchedRC = MatchedRC.get<const Record *>()->getValueAsDef("RegClass");
+    else if (!MatchedRC.get<const Record *>()->isSubClassOf("RegisterClass"))
       return failedImport("Dst MI def isn't a register class" + to_string(Dst));
 
     OperandMatcher &OM = InsnMatcher.getOperand(OpIdx);
@@ -2094,8 +2094,8 @@ Expected<RuleMatcher> GlobalISelEmitter::runOnPattern(const PatternToMatch &P) {
     // GIM_CheckIsSameOperand predicates by the defineOperand method.
     OM.setSymbolicName(getMangledRootDefName(DstIOperand.Name));
     M.defineOperand(OM.getSymbolicName(), OM);
-    if (MatchedRC.is<Record *>())
-      MatchedRC = &Target.getRegisterClass(MatchedRC.get<Record *>());
+    if (MatchedRC.is<const Record *>())
+      MatchedRC = &Target.getRegisterClass(MatchedRC.get<const Record *>());
     OM.addPredicate<RegisterBankOperandMatcher>(
         *MatchedRC.get<const CodeGenRegisterClass *>());
     ++OpIdx;
@@ -2248,8 +2248,10 @@ GlobalISelEmitter::buildMatchTable(MutableArrayRef<RuleMatcher> Rules,
                                                const Matcher *B) {
     auto *L = static_cast<const RuleMatcher *>(A);
     auto *R = static_cast<const RuleMatcher *>(B);
-    return std::tuple(OpcodeOrder[L->getOpcode()], L->getNumOperands()) <
-           std::tuple(OpcodeOrder[R->getOpcode()], R->getNumOperands());
+    return std::tuple(OpcodeOrder[L->getOpcode()],
+                      L->insnmatchers_front().getNumOperandMatchers()) <
+           std::tuple(OpcodeOrder[R->getOpcode()],
+                      R->insnmatchers_front().getNumOperandMatchers());
   });
 
   for (Matcher *Rule : InputRules)

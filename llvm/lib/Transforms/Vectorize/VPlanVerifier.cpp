@@ -160,8 +160,13 @@ bool VPlanVerifier::verifyVPBasicBlock(const VPBasicBlock *VPBB) {
     errs() << "Same IR basic block used by multiple wrapper blocks!\n";
     return false;
   }
-  if (IRBB != IRBB->getPlan()->getPreheader()) {
-    errs() << "VPIRBasicBlock can only be used as pre-header at the moment!\n";
+
+  VPBlockBase *MiddleBB =
+      IRBB->getPlan()->getVectorLoopRegion()->getSingleSuccessor();
+  if (IRBB != IRBB->getPlan()->getPreheader() &&
+      IRBB->getSinglePredecessor() != MiddleBB) {
+    errs() << "VPIRBasicBlock can only be used as pre-header or a successor of "
+              "middle-block at the moment!\n";
     return false;
   }
   return true;
@@ -172,9 +177,8 @@ bool VPlanVerifier::verifyVPBasicBlock(const VPBasicBlock *VPBB) {
 static bool hasDuplicates(const SmallVectorImpl<VPBlockBase *> &VPBlockVec) {
   SmallDenseSet<const VPBlockBase *, 8> VPBlockSet;
   for (const auto *Block : VPBlockVec) {
-    if (VPBlockSet.count(Block))
+    if (!VPBlockSet.insert(Block).second)
       return true;
-    VPBlockSet.insert(Block);
   }
   return false;
 }

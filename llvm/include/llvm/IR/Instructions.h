@@ -29,6 +29,7 @@
 #include "llvm/IR/GEPNoWrapFlags.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/OperandTraits.h"
 #include "llvm/IR/Use.h"
 #include "llvm/IR/User.h"
@@ -750,8 +751,16 @@ public:
     /// *p = ((old == 0) || (old u> v)) ? v : (old - 1)
     UDecWrap,
 
+    /// Subtract only if no unsigned overflow.
+    /// *p = (old u>= v) ? old - v : old
+    USubCond,
+
+    /// *p = usub.sat(old, v)
+    /// \p usub.sat matches the behavior of \p llvm.usub.sat.*.
+    USubSat,
+
     FIRST_BINOP = Xchg,
-    LAST_BINOP = UDecWrap,
+    LAST_BINOP = USubSat,
     BAD_BINOP
   };
 
@@ -1111,9 +1120,8 @@ public:
 };
 
 template <>
-struct OperandTraits<GetElementPtrInst> :
-  public VariadicOperandTraits<GetElementPtrInst, 1> {
-};
+struct OperandTraits<GetElementPtrInst>
+    : public VariadicOperandTraits<GetElementPtrInst> {};
 
 GetElementPtrInst::GetElementPtrInst(Type *PointeeType, Value *Ptr,
                                      ArrayRef<Value *> IdxList, unsigned Values,
@@ -1519,6 +1527,17 @@ public:
   /// Return true if the call can return twice
   bool canReturnTwice() const { return hasFnAttr(Attribute::ReturnsTwice); }
   void setCanReturnTwice() { addFnAttr(Attribute::ReturnsTwice); }
+
+  /// Return true if the call is for a noreturn trap intrinsic.
+  bool isNonContinuableTrap() const {
+    switch (getIntrinsicID()) {
+    case Intrinsic::trap:
+    case Intrinsic::ubsantrap:
+      return !hasFnAttr("trap-func-name");
+    default:
+      return false;
+    }
+  }
 
   // Methods for support type inquiry through isa, cast, and dyn_cast:
   static bool classof(const Instruction *I) {
@@ -2711,9 +2730,7 @@ private:
   void growOperands();
 };
 
-template <>
-struct OperandTraits<PHINode> : public HungoffOperandTraits<2> {
-};
+template <> struct OperandTraits<PHINode> : public HungoffOperandTraits {};
 
 DEFINE_TRANSPARENT_OPERAND_ACCESSORS(PHINode, Value)
 
@@ -2813,8 +2830,7 @@ public:
 };
 
 template <>
-struct OperandTraits<LandingPadInst> : public HungoffOperandTraits<1> {
-};
+struct OperandTraits<LandingPadInst> : public HungoffOperandTraits {};
 
 DEFINE_TRANSPARENT_OPERAND_ACCESSORS(LandingPadInst, Value)
 
@@ -2891,8 +2907,7 @@ private:
 };
 
 template <>
-struct OperandTraits<ReturnInst> : public VariadicOperandTraits<ReturnInst> {
-};
+struct OperandTraits<ReturnInst> : public VariadicOperandTraits<ReturnInst> {};
 
 DEFINE_TRANSPARENT_OPERAND_ACCESSORS(ReturnInst, Value)
 
@@ -3027,8 +3042,7 @@ public:
 };
 
 template <>
-struct OperandTraits<BranchInst> : public VariadicOperandTraits<BranchInst, 1> {
-};
+struct OperandTraits<BranchInst> : public VariadicOperandTraits<BranchInst> {};
 
 DEFINE_TRANSPARENT_OPERAND_ACCESSORS(BranchInst, Value)
 
@@ -3416,9 +3430,7 @@ public:
   static CaseWeightOpt getSuccessorWeight(const SwitchInst &SI, unsigned idx);
 };
 
-template <>
-struct OperandTraits<SwitchInst> : public HungoffOperandTraits<2> {
-};
+template <> struct OperandTraits<SwitchInst> : public HungoffOperandTraits {};
 
 DEFINE_TRANSPARENT_OPERAND_ACCESSORS(SwitchInst, Value)
 
@@ -3542,8 +3554,7 @@ public:
 };
 
 template <>
-struct OperandTraits<IndirectBrInst> : public HungoffOperandTraits<1> {
-};
+struct OperandTraits<IndirectBrInst> : public HungoffOperandTraits {};
 
 DEFINE_TRANSPARENT_OPERAND_ACCESSORS(IndirectBrInst, Value)
 
@@ -4093,7 +4104,7 @@ public:
 };
 
 template <>
-struct OperandTraits<CatchSwitchInst> : public HungoffOperandTraits<2> {};
+struct OperandTraits<CatchSwitchInst> : public HungoffOperandTraits {};
 
 DEFINE_TRANSPARENT_OPERAND_ACCESSORS(CatchSwitchInst, Value)
 
@@ -4325,7 +4336,7 @@ private:
 
 template <>
 struct OperandTraits<CleanupReturnInst>
-    : public VariadicOperandTraits<CleanupReturnInst, /*MINARITY=*/1> {};
+    : public VariadicOperandTraits<CleanupReturnInst> {};
 
 DEFINE_TRANSPARENT_OPERAND_ACCESSORS(CleanupReturnInst, Value)
 
@@ -4885,7 +4896,7 @@ inline Value *getPointerOperand(Value *V) {
 }
 
 /// A helper function that returns the alignment of load or store instruction.
-inline Align getLoadStoreAlignment(Value *I) {
+inline Align getLoadStoreAlignment(const Value *I) {
   assert((isa<LoadInst>(I) || isa<StoreInst>(I)) &&
          "Expected Load or Store instruction");
   if (auto *LI = dyn_cast<LoadInst>(I))
@@ -4895,7 +4906,7 @@ inline Align getLoadStoreAlignment(Value *I) {
 
 /// A helper function that returns the address space of the pointer operand of
 /// load or store instruction.
-inline unsigned getLoadStoreAddressSpace(Value *I) {
+inline unsigned getLoadStoreAddressSpace(const Value *I) {
   assert((isa<LoadInst>(I) || isa<StoreInst>(I)) &&
          "Expected Load or Store instruction");
   if (auto *LI = dyn_cast<LoadInst>(I))
@@ -4904,7 +4915,7 @@ inline unsigned getLoadStoreAddressSpace(Value *I) {
 }
 
 /// A helper function that returns the type of a load or store instruction.
-inline Type *getLoadStoreType(Value *I) {
+inline Type *getLoadStoreType(const Value *I) {
   assert((isa<LoadInst>(I) || isa<StoreInst>(I)) &&
          "Expected Load or Store instruction");
   if (auto *LI = dyn_cast<LoadInst>(I))
@@ -4928,6 +4939,23 @@ inline std::optional<SyncScope::ID> getAtomicSyncScopeID(const Instruction *I) {
   if (auto *AI = dyn_cast<AtomicRMWInst>(I))
     return AI->getSyncScopeID();
   llvm_unreachable("unhandled atomic operation");
+}
+
+/// A helper function that sets an atomic operation's sync scope.
+inline void setAtomicSyncScopeID(Instruction *I, SyncScope::ID SSID) {
+  assert(I->isAtomic());
+  if (auto *AI = dyn_cast<LoadInst>(I))
+    AI->setSyncScopeID(SSID);
+  else if (auto *AI = dyn_cast<StoreInst>(I))
+    AI->setSyncScopeID(SSID);
+  else if (auto *AI = dyn_cast<FenceInst>(I))
+    AI->setSyncScopeID(SSID);
+  else if (auto *AI = dyn_cast<AtomicCmpXchgInst>(I))
+    AI->setSyncScopeID(SSID);
+  else if (auto *AI = dyn_cast<AtomicRMWInst>(I))
+    AI->setSyncScopeID(SSID);
+  else
+    llvm_unreachable("unhandled atomic operation");
 }
 
 //===----------------------------------------------------------------------===//
